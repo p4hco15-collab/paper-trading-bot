@@ -2,6 +2,7 @@ services:
   - type: web
     name: paper-trading-bot
     runtime: node
+    nodeVersion: "20"
     plan: free
     buildCommand: npm install
     startCommand: npm start
