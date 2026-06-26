@@ -102,7 +102,6 @@
   .stat-chip b{ color:var(--text-mid); font-weight:700; margin-left:3px; }
   .stat-chip.win b{ color:var(--green); }
   .stat-chip.loss b{ color:var(--red); }
-
   .save-bar{
     display:flex; align-items:center; justify-content:center; gap:6px;
     margin-top:8px; padding:5px 8px; border-radius:6px; font-size:10px;
@@ -116,7 +115,6 @@
   .save-bar.fail .save-dot{ background:var(--red); }
   .save-bar.saving .save-dot{ background:var(--accent); animation:savePulse 0.8s infinite; }
   @keyframes savePulse{ 0%,100%{opacity:1;} 50%{opacity:.3;} }
-
   .price-section{
     flex:0 0 auto; padding:18px 16px; background:var(--bg-1);
     border-bottom:1px solid var(--border); text-align:center;
@@ -289,6 +287,12 @@
     padding: 12px; border-radius: 8px; font-weight: 700; cursor: pointer; font-size: 14px;
   }
   .bt-close-btn:active { background: var(--border); }
+  .restore-banner{
+    display:none; align-items:center; justify-content:center; gap:6px;
+    background:rgba(240,185,11,.12); border:1px solid rgba(240,185,11,.4); border-radius:6px;
+    padding:8px 10px; margin-bottom:10px; font-size:11px; color:var(--accent); font-weight:700; letter-spacing:.04em;
+  }
+  .restore-banner.active{ display:flex; }
   ::-webkit-scrollbar{ width:6px; }
   ::-webkit-scrollbar-track{ background:transparent; }
   ::-webkit-scrollbar-thumb{ background:var(--border); border-radius:3px; }
@@ -365,6 +369,10 @@
         <input type="checkbox" id="trailingToggle">
         <span class="mini-slider"></span>
       </label>
+    </div>
+
+    <div class="restore-banner" id="restoreBanner">
+      <span>&#128260; Restored open position from last session</span>
     </div>
 
     <div class="market-structure">
@@ -505,6 +513,7 @@
   var tradeHistoryArr=[], thinking=false, thinkTimer=null;
   var thinkSecondsLeft=THINK_SECONDS, thinkBiasSide=null;
   var audioCtx=null, backtesting=false, serverOnline=false;
+  var positionRestored=false;
 
   var el = {
     botToggle:document.getElementById('botToggle'),
@@ -520,6 +529,7 @@
     statBalance:document.getElementById('statBalance'),
     saveBar:document.getElementById('saveBar'),
     saveText:document.getElementById('saveText'),
+    restoreBanner:document.getElementById('restoreBanner'),
     livePrice:document.getElementById('livePrice'),
     tvFrame:document.getElementById('tvFrame'),
     chartLoading:document.getElementById('chartLoading'),
@@ -586,17 +596,34 @@
   }
 
   // ==================== STATE MANAGEMENT ====================
-  // Always saves to BOTH server and localStorage
+  // Saves EVERYTHING: balance, history, AND active position
   function saveState(){
     var state={
-      balance:balance, tradesCount:tradesCount, wins:wins, losses:losses,
-      history:tradeHistoryArr
+      balance:balance,
+      tradesCount:tradesCount,
+      wins:wins,
+      losses:losses,
+      history:tradeHistoryArr,
+      activePosition: position ? {
+        side:position.side,
+        entry:position.entry,
+        qty:position.qty,
+        tpPrice:position.tpPrice,
+        slPrice:position.slPrice,
+        initialSlPrice:position.initialSlPrice,
+        stakedAmount:position.stakedAmount,
+        tpDollars:position.tpDollars,
+        slDollars:position.slDollars,
+        maxPnl:position.maxPnl||0
+      } : null,
+      trailingActive: trailingActive,
+      pairSymbol: currentPair.symbol
     };
 
-    // 1) ALWAYS save to localStorage first (never fails)
+    // Always save to localStorage first (never fails)
     try{localStorage.setItem('paperBotState',JSON.stringify(state));}catch(e){}
 
-    // 2) Try to save to server
+    // Try server
     if(serverOnline){
       showSaveStatus('saving','Saving to server...');
       fetch('/api/state',{
@@ -607,9 +634,7 @@
         if(res.ok){
           showSaveStatus('ok','Saved to server + browser');
           setTimeout(function(){ showSaveStatus('ok','Server + Browser storage active'); },3000);
-        }else{
-          throw new Error('server error');
-        }
+        }else{throw new Error('err');}
       }).catch(function(){
         showSaveStatus('fail','Server save failed - browser backup saved');
         setTimeout(function(){ showSaveStatus('ok','Browser storage active (server offline)'); },4000);
@@ -619,63 +644,90 @@
     }
   }
 
-  // On load: try server, try localStorage, use whichever has more trades
   function loadState(){
     return new Promise(function(resolve){
-      var localState = null;
-      try{
-        var raw = localStorage.getItem('paperBotState');
-        if(raw) localState = JSON.parse(raw);
-      }catch(e){}
+      var localState=null;
+      try{var raw=localStorage.getItem('paperBotState');if(raw)localState=JSON.parse(raw);}catch(e){}
 
       fetch('/api/state',{method:'GET'}).then(function(res){
-        if(!res.ok) throw new Error('fail');
+        if(!res.ok)throw new Error('fail');
         return res.json();
       }).then(function(serverState){
-        serverOnline = true;
-        // Use whichever has more trades
-        var serverTrades = (serverState && serverState.tradesCount) || 0;
-        var localTrades = (localState && localState.tradesCount) || 0;
-        if(serverTrades >= localTrades){
-          if(serverState) applyState(serverState);
-          showSaveStatus('ok','Loaded from server (' + serverTrades + ' trades)');
+        serverOnline=true;
+        var st=(serverState&&serverState.tradesCount)||0;
+        var lt=(localState&&localState.tradesCount)||0;
+        if(st>=lt){
+          if(serverState)applyState(serverState);
+          showSaveStatus('ok','Loaded from server ('+st+' trades)');
         }else{
-          if(localState) applyState(localState);
-          // Push local data to server
+          if(localState)applyState(localState);
           if(localState){
-            fetch('/api/state',{
-              method:'POST', headers:{'Content-Type':'application/json'},
-              body:JSON.stringify(localState)
-            }).catch(function(){});
+            fetch('/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(localState)}).catch(function(){});
           }
-          showSaveStatus('ok','Loaded from browser (' + localTrades + ' trades) -> synced to server');
+          showSaveStatus('ok','Loaded from browser ('+lt+' trades) -> synced');
         }
-        setTimeout(function(){ showSaveStatus('ok','Server + Browser storage active'); },4000);
+        setTimeout(function(){showSaveStatus('ok','Server + Browser storage active');},4000);
         resolve();
       }).catch(function(){
-        serverOnline = false;
+        serverOnline=false;
         if(localState){
           applyState(localState);
-          showSaveStatus('fail','Server offline - loaded from browser (' + ((localState.tradesCount)||0) + ' trades)');
-        }else{
-          showSaveStatus('fail','No saved data found');
-        }
+          showSaveStatus('fail','Server offline - loaded from browser ('+((localState.tradesCount)||0)+' trades)');
+        }else{showSaveStatus('fail','No saved data found');}
         resolve();
       });
     });
   }
 
   function applyState(state){
-    balance = state.balance || STARTING_BALANCE;
-    tradesCount = state.tradesCount || 0;
-    wins = state.wins || 0;
-    losses = state.losses || 0;
-    tradeHistoryArr = state.history || [];
-    el.statTrades.textContent = tradesCount;
-    el.statWins.textContent = wins;
-    el.statLosses.textContent = losses;
-    el.statBalance.textContent = fmtUSD(balance);
+    balance=state.balance||STARTING_BALANCE;
+    tradesCount=state.tradesCount||0;
+    wins=state.wins||0;
+    losses=state.losses||0;
+    tradeHistoryArr=state.history||[];
+    el.statTrades.textContent=tradesCount;
+    el.statWins.textContent=wins;
+    el.statLosses.textContent=losses;
+    el.statBalance.textContent=fmtUSD(balance);
     renderHistory();
+
+    // Restore trailing toggle
+    if(state.trailingActive){
+      trailingActive=true;
+      el.trailingToggle.checked=true;
+    }
+
+    // Restore pair if saved
+    if(state.pairSymbol){
+      var savedPair=findPair(state.pairSymbol);
+      if(savedPair){
+        currentPair=savedPair;
+        el.pairDisplay.textContent=currentPair.display;
+      }
+    }
+
+    // Restore active position if exists
+    if(state.activePosition){
+      var ap=state.activePosition;
+      position={
+        side:ap.side, entry:ap.entry, qty:ap.qty,
+        tpPrice:ap.tpPrice, slPrice:ap.slPrice,
+        initialSlPrice:ap.initialSlPrice, stakedAmount:ap.stakedAmount,
+        tpDollars:ap.tpDollars, slDollars:ap.slDollars,
+        maxPnl:ap.maxPnl||0
+      };
+      // Show the position in UI immediately
+      el.sideTag.textContent=position.side;
+      el.sideTag.className="side-tag "+(position.side==="LONG"?"long":"short");
+      el.mEntry.textContent=fmtPrice(position.entry);
+      el.mTP.textContent=fmtPrice(position.tpPrice);
+      el.mSL.textContent=fmtPrice(position.slPrice);
+      el.mSL.style.color="var(--red)";
+      el.restoreBanner.classList.add('active');
+      positionRestored=true;
+      // Hide restore banner after 5 seconds
+      setTimeout(function(){el.restoreBanner.classList.remove('active');},5000);
+    }
   }
 
   function renderHistory(){
@@ -738,6 +790,7 @@
   el.trailingToggle.addEventListener('change',function(){
     trailingActive=this.checked;
     if(trailingActive&&position) position.maxPnl=position.maxPnl||0;
+    saveState();
   });
 
   function buildDropdown(){
@@ -779,18 +832,32 @@
   }
 
   function switchPair(symbol){
+    // If there's an active position, warn before switching
+    if(position){
+      if(!confirm("You have an open "+position.side+" position. Switching pairs will close it at current price. Continue?"))return;
+      // Force close at last known price
+      if(lastPrice!==null){
+        settleTrade(false, lastPrice);
+      }else{
+        position=null;
+        resetPositionUI();
+        saveState();
+      }
+    }
     currentPair=findPair(symbol);el.pairDisplay.textContent=currentPair.display;
     setChartFor(currentPair);clearThinkTimer();
     position=null;lastPrice=null;prevTickPrice=null;resetPositionUI();
     if(botActive){connectStream(currentPair.symbol);enterThinkingMode();}
     buildDropdown();
+    saveState();
   }
 
   function resetAll(){
-    if(!confirm("Reset all stats and history?"))return;
+    if(!confirm("Reset all stats, history, and close any open position?"))return;
     balance=STARTING_BALANCE;tradesCount=0;wins=0;losses=0;tradeHistoryArr=[];
+    position=null;positionRestored=false;
     el.statTrades.textContent="0";el.statWins.textContent="0";el.statLosses.textContent="0";
-    el.statBalance.textContent=fmtUSD(balance);renderHistory();
+    el.statBalance.textContent=fmtUSD(balance);renderHistory();resetPositionUI();
     try{localStorage.removeItem('paperBotState');}catch(e){}
     if(serverOnline){fetch('/api/reset',{method:'POST'}).catch(function(){});}
     switchPair(currentPair.symbol);
@@ -878,6 +945,8 @@
     el.mEntry.textContent=fmtPrice(re);el.mTP.textContent=fmtPrice(tpP);
     el.mSL.textContent=fmtPrice(slP);el.mSL.style.color="var(--red)";
     updateLivePnl(re);
+    // Save immediately so position is persisted
+    saveState();
   }
   function resetPositionUI(){
     el.sideTag.textContent="NO POSITION";el.sideTag.className="side-tag idle";
@@ -936,12 +1005,14 @@
       currentPair.display+" "+cl.side+" closed. PnL: "+(won?"+":"-")+"$"+(won?cl.tpDollars:cl.slDollars).toFixed(2));
     var amt=won?cl.tpDollars:cl.slDollars;
     tradeHistoryArr.push({side:cl.side,entry:cl.entry,exit:exitPrice,tp:cl.tpPrice,sl:cl.initialSlPrice,won:won,amt:amt});
-    saveState();renderHistory();position=null;resetPositionUI();enterThinkingMode();
+    position=null;positionRestored=false;
+    resetPositionUI();renderHistory();saveState();enterThinkingMode();
   }
   function handleTick(rp){
     var p=round2(rp);lastPrice=p;el.livePrice.textContent=fmtPrice(p);
     if(!botActive||backtesting)return;
-    if(position)updateLivePnl(p);else{if(!thinking)enterThinkingMode();}
+    if(position)updateLivePnl(p);
+    else{if(!thinking)enterThinkingMode();}
   }
   function setConn(s){
     if(s==="stopped"){el.connDot.className="dot stopped";el.connText.textContent="Bot Stopped";return;}
@@ -1000,14 +1071,21 @@
       document.getElementById('btCloseBtn').addEventListener('click',function(){el.btOverlay.classList.remove('active');});
     }).finally(function(){
       backtesting=false;el.backtestBtn.textContent="Run 7-Day Backtest";el.backtestBtn.disabled=false;
-      if(botActive)enterThinkingMode();
+      if(botActive&&!position)enterThinkingMode();
     });
   });
 
   // ==================== INIT ====================
   loadState().then(function(){
-    buildDropdown();el.pairDisplay.textContent=currentPair.display;
-    setChartFor(currentPair);connectStream(currentPair.symbol);enterThinkingMode();
+    buildDropdown();
+    el.pairDisplay.textContent=currentPair.display;
+    setChartFor(currentPair);
+    connectStream(currentPair.symbol);
+    // If no position restored, start thinking
+    // If position WAS restored, the WebSocket will resume monitoring it automatically via handleTick -> updateLivePnl -> checkExit
+    if(!position){
+      enterThinkingMode();
+    }
   });
 
 })();
